@@ -1,7 +1,49 @@
-import { useState, useEffect, useRef } from 'react';
+import { useState, useRef } from 'react';
 import { GoogleGenAI, Modality } from "@google/genai";
-import { Mic, MicOff, Volume2, VolumeX, Loader2 } from 'lucide-react';
+import { Mic, MicOff, Volume2, Search, Loader2 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
+
+// Consulta RUC e estado tributario en paralelo desde Supabase
+async function consultarRUC(ruc: string): Promise<string> {
+  try {
+    const [resRuc, resEstado] = await Promise.allSettled([
+      fetch('/api/ruc/consultar', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ruc }) }),
+      fetch('/api/ruc/estado-tributario', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ruc }) }),
+    ]);
+
+    let partes: string[] = [];
+
+    if (resRuc.status === 'fulfilled' && resRuc.value.ok) {
+      const json = await resRuc.value.json();
+      const d = json.data;
+      if (d) {
+        const nombre = d.razon_social || d.nombre || d.name || JSON.stringify(d);
+        const estado = d.estado || d.status || '';
+        const tipo = d.tipo_contribuyente || d.tipo || '';
+        const act = d.actividad_economica || d.actividad || '';
+        let info = `Contribuyente: ${nombre}`;
+        if (estado) info += `, Estado: ${estado}`;
+        if (tipo) info += `, Tipo: ${tipo}`;
+        if (act) info += `, Actividad: ${act}`;
+        partes.push(info);
+      }
+    }
+
+    if (resEstado.status === 'fulfilled' && resEstado.value.ok) {
+      const json = await resEstado.value.json();
+      if (json.data) {
+        const estadoStr = typeof json.data === 'string' ? json.data : JSON.stringify(json.data);
+        partes.push(`Estado tributario: ${estadoStr}`);
+      }
+    }
+
+    if (partes.length === 0) return `No se encontraron datos para el RUC ${ruc} en Supabase.`;
+    return `RUC ${ruc} — ${partes.join(' | ')}`;
+  } catch (e: any) {
+    return `Error al consultar el RUC ${ruc}: ${e.message}`;
+  }
+}
+
 
 export default function LiveVoice() {
   const [isActive, setIsActive] = useState(false);
@@ -9,8 +51,9 @@ export default function LiveVoice() {
   const [isMuted, setIsMuted] = useState(false);
   const [transcript, setTranscript] = useState<string>("");
   const [aiTranscript, setAiTranscript] = useState<string>("");
+  const [rucInfo, setRucInfo] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
-  
+
   const sessionRef = useRef<any>(null);
   const audioContextRef = useRef<AudioContext | null>(null);
   const processorRef = useRef<ScriptProcessorNode | null>(null);
@@ -18,15 +61,45 @@ export default function LiveVoice() {
   const audioQueue = useRef<Int16Array[]>([]);
   const isPlaying = useRef(false);
 
+  const lastQueriedRuc = useRef<string | null>(null);
+
+  // Detecta RUCs (13 dígitos) en el texto transcrito del usuario
+  // y envía el resultado real de Supabase de vuelta a la sesión de Gemini
+  const detectAndQueryRUC = async (text: string) => {
+    const match = text.match(/\b(\d{13})\b/);
+    if (!match) return;
+    const ruc = match[1];
+
+    // Evitar consultar el mismo RUC múltiples veces en el mismo turno
+    if (lastQueriedRuc.current === ruc) return;
+    lastQueriedRuc.current = ruc;
+
+    setRucInfo(`Consultando RUC ${ruc} en Supabase...`);
+    const resultado = await consultarRUC(ruc);
+    setRucInfo(resultado);
+
+    // Inyectar el resultado real en la sesión de Gemini para que lo lea en voz alta
+    if (sessionRef.current) {
+      sessionRef.current.sendClientContent({
+        turns: [{
+          role: 'user',
+          parts: [{ text: `[SISTEMA - Resultado de Supabase para RUC ${ruc}]: ${resultado}. Por favor lee esta información al usuario.` }]
+        }],
+        turnComplete: true,
+      });
+    }
+  };
+
   const startSession = async () => {
     setIsConnecting(true);
     setError(null);
+    setRucInfo(null);
     try {
       const apiKey = process.env.GEMINI_API_KEY;
       if (!apiKey) throw new Error("API Key de Gemini no encontrada.");
 
       const ai = new GoogleGenAI({ apiKey });
-      
+
       const session = await ai.live.connect({
         model: "gemini-2.5-flash-native-audio-preview-09-2025",
         config: {
@@ -34,7 +107,10 @@ export default function LiveVoice() {
           speechConfig: {
             voiceConfig: { prebuiltVoiceConfig: { voiceName: "Zephyr" } },
           },
-          systemInstruction: "Eres un asistente de voz experto en automatización de WhatsApp y ManyChat. Tu nombre es VozAI. Eres amable, profesional y respondes de forma concisa.",
+          systemInstruction: `Eres VozAI, un asistente vocal inteligente especializado en consultas del SRI de Ecuador. 
+Cuando el usuario mencione un número RUC (siempre de 13 dígitos), dile que lo estás consultando. 
+El sistema procesará automáticamente la consulta y te dará los datos. 
+Responde de forma concisa y profesional en español. Si el usuario no menciona un RUC, ayúdalo con preguntas sobre contribuyentes, facturas o el SRI.`,
           inputAudioTranscription: {},
           outputAudioTranscription: {},
         },
@@ -61,7 +137,16 @@ export default function LiveVoice() {
             }
 
             if (message.serverContent?.modelTurn?.parts?.[0]?.text) {
-                setAiTranscript(prev => prev + message.serverContent?.modelTurn?.parts?.[0]?.text);
+              setAiTranscript(prev => prev + message.serverContent?.modelTurn?.parts?.[0]?.text);
+            }
+
+            // Detectar RUC en la transcripción del usuario
+            const userText = (message as any).clientContent?.turns?.[0]?.parts?.[0]?.text
+              || (message as any).serverContent?.inputTranscription?.text
+              || '';
+            if (userText) {
+              setTranscript(userText);
+              detectAndQueryRUC(userText);
             }
 
             if (message.serverContent?.interrupted) {
@@ -96,6 +181,7 @@ export default function LiveVoice() {
     setIsConnecting(false);
     audioQueue.current = [];
     isPlaying.current = false;
+    lastQueriedRuc.current = null;
   };
 
   const startAudioCapture = async () => {
@@ -112,7 +198,7 @@ export default function LiveVoice() {
         for (let i = 0; i < inputData.length; i++) {
           pcmData[i] = Math.max(-1, Math.min(1, inputData[i])) * 0x7FFF;
         }
-        
+
         const base64Data = btoa(String.fromCharCode(...new Uint8Array(pcmData.buffer)));
         if (sessionRef.current) {
           sessionRef.current.sendRealtimeInput({
@@ -151,11 +237,11 @@ export default function LiveVoice() {
 
     isPlaying.current = true;
     const pcmData = audioQueue.current.shift()!;
-    
+
     if (!audioContextRef.current) {
-        audioContextRef.current = new AudioContext({ sampleRate: 24000 });
+      audioContextRef.current = new AudioContext({ sampleRate: 24000 });
     }
-    
+
     const audioBuffer = audioContextRef.current.createBuffer(1, pcmData.length, 24000);
     const channelData = audioBuffer.getChannelData(0);
     for (let i = 0; i < pcmData.length; i++) {
@@ -182,15 +268,14 @@ export default function LiveVoice() {
             />
           )}
         </AnimatePresence>
-        
+
         <button
           onClick={isActive ? stopSession : startSession}
           disabled={isConnecting}
-          className={`relative z-10 w-32 h-32 rounded-full flex items-center justify-center transition-all duration-300 ${
-            isActive 
-              ? 'bg-red-500 hover:bg-red-600 shadow-lg shadow-red-500/20' 
-              : 'bg-emerald-500 hover:bg-emerald-600 shadow-lg shadow-emerald-500/20'
-          } ${isConnecting ? 'opacity-50 cursor-not-allowed' : ''}`}
+          className={`relative z-10 w-32 h-32 rounded-full flex items-center justify-center transition-all duration-300 ${isActive
+            ? 'bg-red-500 hover:bg-red-600 shadow-lg shadow-red-500/20'
+            : 'bg-emerald-500 hover:bg-emerald-600 shadow-lg shadow-emerald-500/20'
+            } ${isConnecting ? 'opacity-50 cursor-not-allowed' : ''}`}
         >
           {isConnecting ? (
             <Loader2 className="w-12 h-12 animate-spin text-white" />
@@ -207,8 +292,8 @@ export default function LiveVoice() {
           {isActive ? "Conversación en Vivo" : isConnecting ? "Conectando..." : "Inicia la IA de Voz"}
         </h2>
         <p className="text-zinc-400 max-w-md">
-          {isActive 
-            ? "Habla ahora. La IA te responderá en tiempo real con voz natural." 
+          {isActive
+            ? "Habla ahora. La IA te responderá en tiempo real con voz natural."
             : "Experimenta la potencia de Gemini 2.5 Live API antes de integrarla en WhatsApp."}
         </p>
         {error && (
@@ -235,13 +320,27 @@ export default function LiveVoice() {
       )}
 
       {aiTranscript && (
-        <motion.div 
+        <motion.div
           initial={{ opacity: 0, y: 20 }}
           animate={{ opacity: 1, y: 0 }}
           className="w-full max-w-lg p-6 rounded-2xl glass text-sm leading-relaxed text-zinc-300 italic"
         >
-          <span className="text-emerald-400 font-semibold mr-2">VozAI:</span>
+          <span className="text-emerald-400 font-semibold mr-2 not-italic">VozAI:</span>
           {aiTranscript}
+        </motion.div>
+      )}
+
+      {rucInfo && (
+        <motion.div
+          initial={{ opacity: 0, y: 20 }}
+          animate={{ opacity: 1, y: 0 }}
+          className="w-full max-w-lg p-5 rounded-2xl border border-blue-500/30 bg-blue-500/10 text-sm"
+        >
+          <div className="flex items-center space-x-2 mb-2">
+            <Search className="w-4 h-4 text-blue-400" />
+            <span className="text-blue-400 font-semibold text-xs uppercase tracking-widest">Consulta RUC — SRI Ecuador</span>
+          </div>
+          <p className="text-zinc-200 leading-relaxed">{rucInfo}</p>
         </motion.div>
       )}
     </div>
