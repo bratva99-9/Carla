@@ -1,0 +1,7 @@
+{
+  "name": "VozAI - WhatsApp & Live Voice",
+  "description": "Conversational AI with real-time voice (Live API) and ManyChat/WhatsApp integration guide.",
+  "requestFramePermissions": [
+    "microphone"
+  ]
+}
